@@ -1,0 +1,425 @@
+# This script is for demonstration purposes only
+
+
+# -----------------------
+# Step 0: Download raw data
+# -----------------------
+
+# Here we download paired-end FASTQ reads for the sample from the ENA database
+ftp://ftp.sra.ebi.ac.uk/vol1/fastq/SRR062/SRR062634/SRR062634_1.fastq.gz 
+ftp://ftp.sra.ebi.ac.uk/vol1/fastq/SRR062/SRR062634/SRR062634_2.fastq.gz 
+
+# Creates folder structure to organize files
+mkdir aligned_reads reads scripts results data
+echo "Run Prep files..."
+
+# -----------------------
+# Step 1: Download reference files
+# -----------------------
+
+########### Prep files (TO BE GENERATED ONLY ONCE) ###########
+# Reference genome (hg38), index, and known variant sites (dbSNP)
+
+# download reference files
+wget -P ~/GATK/index_files/ https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz
+gunzip hg38.fa.gz
+
+# index ref - .fai file before running the haplotype caller
+# creates FASTA index (.fai)
+samtools faidx hg38.fa
+
+# ref dict - .dict file before running haplotype caller
+# creates sequence dictionary (.dict)
+gatk CreateSequenceDictionary -R hg38.fa -O hg38.dict
+
+# download known sites files 
+
+wget -P index_files/ https://storage.googleapis.com/genomics-public-data/resources/broad/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf 
+wget -P index_files/ https://storage.googleapis.com/genomics-public-data/resources/broad/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf.idx
+
+wget -P index_files/ https://storage.googleapis.com/genomics-public-data/resources/broad/hg38/v0/Mills_and_1000G_gold_standard.indels.hg38.vcf 
+wget -P index_files/ https://storage.googleapis.com/genomics-public-data/resources/broad/hg38/v0/Mills_and_1000G_gold_standard.indels.hg38.vcf.idx
+
+wget -P index_files/ https://storage.googleapis.com/gcp-public-data--broad-references/hg38/v0/hapmap_3.3.hg38.vcf.gz 
+gunzip index_files/hapmap_3.3.hg38.vcf.gz
+
+wget -P index_files/ https://storage.googleapis.com/gcp-public-data--broad-references/hg38/v0/1000G_omni2.5.hg38.vcf.gz 
+gunzip index_files/1000G_omni2.5.hg38.vcf.gz
+
+wget -P index_files/ https://storage.googleapis.com/gcp-public-data--broad-references/hg38/v0/1000G_phase1.snps.high_confidence.hg38.vcf.gz 
+gunzip index_files/1000G_phase1.snps.high_confidence.hg38.vcf.gz
+
+
+# Define directories
+ref="/mnt/d/GATK/index_files/hg38.fa"
+known_sites="/mnt/d/GATK/index_files/Homo_sapiens_assembly38.dbsnp138.vcf"
+known_mills="/mnt/d/GATK/index_files/Mills_and_1000G_gold_standard.indels.hg38.vcf" 
+known_hapmap="/mnt/d/GATK/index_files/hapmap_3.3.hg38.vcf" 
+known_omni="/mnt/d/GATK/index_files/1000G_omni2.5.hg38.vcf" 
+known_1000g="/mnt/d/GATK/index_files/1000G_phase1.snps.high_confidence.hg38.vcf"
+#qc="/mnt/d/GATK/qc" 
+#recal="/mnt/d/GATK/recal"
+aligned_reads="/mnt/d/GATK/aligned_reads"
+reads="/mnt/d/GATK/reads"
+results="/mnt/d/GATK/results"
+data="/mnt/d/GATK/data"
+
+# -----------------------
+# Step 2: QC of raw reads
+# -----------------------
+
+# FastQC evaluates sequence quality, GC content, and adapter contamination
+fastqc ${reads}/SRR062634_1.fastq -o ${reads}/
+fastqc ${reads}/SRR062634_2.fastq -o ${reads}/
+# No trimming required: No adapter sequence.
+
+
+#_______If trimming is required_______#
+
+# Trim adapters and low-quality bases using Trim Galore
+# This removes:
+# - Illumina sequencing adapters that can interfere with alignment
+# - Low-quality bases (quality score < 20) from read ends
+# - Very short reads (< 50bp) that may align poorly
+trim_galore \
+    --paired \           # Indicates we have paired-end reads (R1 and R2)
+    --quality 20 \       # Remove bases with quality score < 20
+    --length 50 \        # Discard reads shorter than 50bp after trimming
+    --fastqc \           # Run FastQC on trimmed reads for comparison
+    --output_dir ~GATK/${reads} \
+    ~/wgs_analysis/data/${reads}_R1.fastq.gz \
+    ~/wgs_analysis/data/${reads}_R2.fastq.gz
+
+
+# -----------------------
+# Step 3: Alignment: Map reads to reference genome using BWA-MEM
+# -----------------------
+
+# BWA index reference (Only once)
+bwa index ${ref}
+
+# BWA alignment
+bwa mem -t 4 -M -R "@RG\tID:SRR062634\tPL:ILLUMINA\tSM:SRR062634"
+${ref} ${reads}/SRR062634_1.fastq.gz ${reads}/SRR062634_2.fastq.gz |
+samtools sort -o ${aligned_reads}/SRR062634.sorted.bam
+
+samtools index ${aligned_reads}/SRR062634.sorted.bam
+# -----------------------------------------
+# STEP 4: Mark Duplicates and Sort - GATK4
+# -----------------------------------------
+
+# Removes PCR duplicates to reduce false positives
+gatk MarkDuplicatesSpark \
+    -I ${aligned_reads}/SRR062634.paired.bam \
+    -O ${aligned_reads}/SRR062634_sorted_dedup_reads.bam
+    -M ${aligned_reads}/duplicate_metrics.txt
+# -----------------------
+# Step 5: Base Quality Score Recalibration (BQSR)
+# -----------------------
+
+# Corrects sequencing machine errors using known variant sites
+
+# 1. build the model
+gatk BaseRecalibrator \
+    -I ${aligned_reads}/SRR062634_sorted_dedup_reads.bam \
+    -R ${ref} \
+    --known-sites ${known_sites} \
+    --known-sites ${known_mills} \
+    -O ${data}/recal_data.table
+
+# 2. Apply the model to adjust the base quality scores
+gatk ApplyBQSR -I ${aligned_reads}/SRR062634_sorted_dedup_reads.bam \
+  -R ${ref} \
+  --bqsr-recal-file ${data}/recal_data.table \
+  -O ${aligned_reads}/SRR062634_sorted_dedup_bqsr_reads.bam
+
+# -----------------------
+# Step 6: Collect QC metrics
+# -----------------------
+
+# Generates alignment and insert size statistics
+gatk CollectAlignmentSummaryMetrics
+-R ${ref}
+-I ${aligned_reads}/SRR062634_sorted_dedup_bqsr_reads.bam
+-O ${qc}/alignment_metrics.txt
+
+gatk CollectInsertSizeMetrics
+-I ${aligned_reads}/SRR062634_sorted_dedup_bqsr_reads.bam
+-O ${qc}/insert_size_metrics.txt
+-H ${qc}/insert_size_histogram.pdf
+# -----------------------
+# Step 7: Variant Calling (GVCF mode)
+# -----------------------
+
+# Calls SNPs and INDELs using HaplotypeCaller
+gatk HaplotypeCaller
+-R ${ref}
+-I ${aligned_reads}/SRR062634_sorted_dedup_bqsr_reads.bam
+-O ${results}/SRR062634.g.vcf.gz
+-ERC GVCF
+--dbsnp ${known_sites}
+
+#Joint genotyping (single sample here)
+
+gatk GenotypeGVCFs
+-R ${ref}
+-V ${results}/SRR062634.g.vcf.gz
+-O ${results}/raw_variants.vcf.gz
+
+
+# extract SNPs & INDELS
+gatk SelectVariants -R ${ref} -V ${results}/raw_variants.vcf.gz --select-type SNP -O ${results}/raw_snps.vcf.gz 
+gatk SelectVariants -R ${ref} -V ${results}/raw_variants.vcf.gz --select-type INDEL -O ${results}/raw_indels.vcf.gz
+
+
+-----------------------
+Step 8: Variant Quality Score Recalibration (VQSR)
+-----------------------
+
+#SNP recalibration
+
+gatk VariantRecalibrator
+-R ${ref}
+-V ${results}/raw_snps.vcf.gz
+--resource:hapmap,known=false,training=true,truth=true,prior=15.0 ${known_hapmap}
+--resource:omni,known=false,training=true,truth=true,prior=12.0 ${known_omni}
+--resource:1000G,known=false,training=true,truth=false,prior=10.0 ${known_1000g}
+--resource:dbsnp,known=true,training=false,truth=false,prior=2.0 ${known_sites}
+-an QD -an MQ -an MQRankSum -an ReadPosRankSum -an FS -an SOR
+-mode SNP
+-O ${results}/snp.recal
+--tranches-file ${results}/snp.tranches
+
+
+gatk ApplyVQSR
+-R ${ref}
+-V ${results}/raw_snps.vcf.gz
+--recal-file ${results}/snp.recal
+--tranches-file ${results}/snp.tranches
+-mode SNP
+--truth-sensitivity-filter-level 99.0
+-O ${results}/filtered_snps.vcf.gz
+
+
+#INDEL recalibration
+
+-R ${ref}
+-V ${results}/raw_indels.vcf.gz
+--resource:mills,known=false,training=true,truth=true,prior=12.0 ${known_mills}
+--resource:dbsnp,known=true,training=false,truth=false,prior=2.0 ${known_sites}
+-an QD -an ReadPosRankSum -an FS -an SOR
+-mode INDEL
+-O ${results}/indel.recal
+--tranches-file ${results}/indel.tranches
+
+gatk ApplyVQSR
+-R ${ref}
+-V ${results}/raw_indels.vcf.gz
+--recal-file ${results}/indel.recal
+--tranches-file ${results}/indel.tranches
+-mode INDEL
+--truth-sensitivity-filter-level 95.0
+-O ${results}/filtered_indels.vcf.gz
+
+
+
+-----------------------
+Step 9: Select PASS variants
+-----------------------
+
+gatk SelectVariants --exclude-filtered -V ${results}/filtered_snps.vcf.gz -O ${results}/analysis_ready_snps.vcf.gz 
+gatk SelectVariants --exclude-filtered -V ${results}/filtered_indels.vcf.gz -O ${results}/analysis_ready_indels.vcf.gz
+
+
+
+-----------------------
+Step 10: Functional Annotation (snpEff)
+-----------------------
+
+java -Xmx16g -jar /opt/snpEff/snpEff.jar
+-stats ${results}/snpEff_snps.html
+GRCh38.105
+${results}/analysis_ready_snps.vcf.gz > ${results}/analysis_ready_snps_annotated.vcf
+
+bgzip ${results}/analysis_ready_snps_annotated.vcf
+
+
+
+-----------------------
+Step 11: Convert annotated VCF to table format
+-----------------------
+
+#Basic variant-level table with snpEff ANN field
+
+gatk VariantsToTable
+-V ${results}/analysis_ready_snps_annotated.vcf.gz
+-F CHROM
+-F POS
+-F REF
+-F ALT
+-F QUAL
+-GF GT
+-GF DP
+-GF GQ
+-F ANN
+-O ${results}/analysis_ready_snps_variants_table_rawANN.tsv
+
+
+#Expand ANN field into multiple columns (pipe-separated)
+
+sed 's/|/ /g'
+${results}/analysis_ready_snps_variants_table_rawANN.tsv
+> ${results}/analysis_ready_snps_variants_table_expanded.tsv
+
+
+#The resulting table contains these key columns:
+
+#CHROM: Chromosome where the variant is located
+#POS: Genomic position of the variant
+#REF: Reference allele (what the reference genome has at this position)
+#ALT: Alternate allele (the variant observed in your sample)
+#QUAL: Quality score of the variant call (higher = more confident)
+#ANN: SnpEff annotation containing effect predictions, gene names, and impact ratings
+
+
+-----------------------
+Step 12: Variant statistics and counts
+-----------------------
+
+
+#Generate comprehensive variant statistics using bcftools
+
+bcftools stats
+${results}/analysis_ready_snps.vcf.gz
+> ${results}/analysis_ready_snps_stats.txt
+
+bcftools stats
+${results}/analysis_ready_indels.vcf.gz
+> ${results}/analysis_ready_indels_stats.txt
+
+
+#Count SNPs
+bcftools view -v snps ${results}/analysis_ready_snps.vcf.gz |
+bcftools query -f '. ' | wc -l
+> ${results}/analysis_ready_snps_count.txt
+
+
+#Count INDELs
+bcftools view -v indels ${results}/analysis_ready_indels.vcf.gz |
+bcftools query -f '. ' | wc -l
+> ${results}/analysis_ready_indels_count.txt
+
+
+-----------------------
+Step 13: QC Summary Report
+-----------------------
+
+SAMPLE="SRR062634"
+
+QC_SUMMARY=${results}/${SAMPLE}_QC_SUMMARY.txt
+
+{ echo "=========================================" echo 
+"WGS Quality Control Summary for ${SAMPLE}" echo 
+"=========================================" echo
+
+echo "=== ALIGNMENT QUALITY ==="
+echo -n "Mapping Rate: "
+grep -A1 "FIRST_OF_PAIR" ${qc}/alignment_metrics.txt | tail -1 | cut -f7
+echo " (Benchmark: >95%)"
+echo
+
+
+echo -n "Duplicate Rate: "
+grep -A1 "LIBRARY" ${aligned_reads}/duplicate_metrics.txt | tail -1 | cut -f9
+echo " (Benchmark: <30%)"
+echo
+
+
+echo -n "Mean Insert Size: "
+grep -A1 "MEDIAN_INSERT_SIZE" ${qc}/insert_size_metrics.txt | tail -1 | cut -f1
+echo " bp (Benchmark: 300–500 bp)"
+echo
+
+
+echo "=== VARIANT CALLING QUALITY ==="
+echo -n "Total SNPs: "
+cat ${results}/analysis_ready_snps_count.txt
+echo " (Benchmark: 4–5 million)"
+echo
+
+
+echo -n "Total INDELs: "
+cat ${results}/analysis_ready_indels_count.txt
+echo " (Benchmark: 0.5–0.8 million)"
+echo
+
+echo -n "Ti/Tv Ratio: "
+grep -v "^#" ${results}/analysis_ready_snps_stats.txt | grep "TSTV" | cut -f5
+echo " (Benchmark: 2.0–2.1)"
+echo
+
+
+echo "========================================="
+
+} > ${QC_SUMMARY}
+
+echo "QC summary written to ${QC_SUMMARY}"
+
+
+-----------------------
+Step 15: Genome browser visualization files
+-----------------------
+Create BED file for genome browser visualization (IGV / UCSC)
+
+bcftools query
+-f '%CHROM\t%POS0\t%END\t%ID
+
+
+
+
+
+##NOTES: For multiple sample- Multi-Sample Joint Calling Workflow
+
+cat > sample_map.txt << EOF
+sample1	/mnt/d/GATK/results/SRR062634.g.vcf.gz
+sample2	/mnt/d/GATK/results/SRR062635.g.vcf.gz
+sample3	/mnt/d/GATK/results/SRR062636.g.vcf.gz
+EOF
+
+# Process one chromosome a time for large datasets
+gatk GenomicsDBImport \
+    --sample-name-map sample_map.txt \
+    --genomicsdb-workspace-path genomicsdb_chr1 \
+    --intervals chr1 \
+    --reader-threads 4
+
+
+gatk GenotypeGVCFs \
+    -R ~/wgs_analysis/index_files/hg38.fa \
+    -V gendb://genomicsdb_chr1 \
+    -O cohort_chr1_raw.vcf.gz
+
+
+#OR Scale to the whole genome - Loop over chromosomes
+
+
+for chr in {1..22} X Y; do
+    gatk GenomicsDBImport \
+        --sample-name-map sample_map.txt \
+        --genomicsdb-workspace-path genomicsdb_chr${chr} \
+        --intervals chr${chr} \
+        --reader-threads 4
+
+    gatk GenotypeGVCFs \
+        -R ~/wgs_analysis/index_files/hg38.fa \
+        -V gendb://genomicsdb_chr${chr} \
+        -O cohort_chr${chr}.vcf.gz
+done
+
+#Merge chromosome VCFs
+
+gatk MergeVcfs \
+    -I cohort_chr1.vcf.gz \
+    -I cohort_chr2.vcf.gz \
+    ...
+    -O cohort_raw_variants.vcf.gz
